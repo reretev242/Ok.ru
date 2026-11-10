@@ -1,0 +1,113 @@
+name: okru2mega
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "ok.ru video link (https://ok.ru/video/ID)"
+        required: true
+        type: string
+      folder:
+        description: "MEGA folder (blank = okru)"
+        required: false
+        type: string
+
+concurrency:
+  group: okru2mega
+  cancel-in-progress: false
+
+jobs:
+  transfer:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+
+    env:
+      RCLONE_MEGA_USER: ${{ secrets.MEGA_EMAIL }}
+      RCLONE_MEGA_PASS: ${{ secrets.MEGA_PASSWORD }}
+      RCLONE_MEGA_2FA: ${{ secrets.MEGA_2FA }}
+
+    steps:
+      - name: Tools install
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg rclone
+          sudo curl -fsSL https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp \
+            -o /usr/local/bin/yt-dlp
+          sudo chmod +x /usr/local/bin/yt-dlp
+          yt-dlp --version
+          rclone version | head -n1
+          df -h / | tail -n1
+
+      - name: Link check
+        run: |
+          set -euo pipefail
+          URL="${{ inputs.url }}"
+          URL="${URL//m.ok.ru/ok.ru}"
+          URL="${URL%%\?*}"
+          if [[ ! "$URL" =~ ^https?://([a-z0-9-]+\.)*(ok\.ru|odnoklassniki\.ru)/ ]]; then
+            echo "::error::Valid ok.ru link nahi hai: $URL"
+            exit 1
+          fi
+          echo "URL=$URL" >> "$GITHUB_ENV"
+
+          FOLDER="${{ inputs.folder }}"
+          [ -z "$FOLDER" ] && FOLDER="${{ vars.MEGA_FOLDER }}"
+          [ -z "$FOLDER" ] && FOLDER="okru"
+          echo "FOLDER=$FOLDER" >> "$GITHUB_ENV"
+          echo "Target: MEGA:/$FOLDER"
+
+      - name: Secrets check
+        run: |
+          [ -n "$RCLONE_MEGA_USER" ] || { echo "::error::MEGA_EMAIL secret missing"; exit 1; }
+          [ -n "$RCLONE_MEGA_PASS" ] || { echo "::error::MEGA_PASSWORD secret missing"; exit 1; }
+          echo "secrets ok"
+
+      - name: Download from ok.ru
+        run: |
+          set -euo pipefail
+          mkdir -p dl
+          ARGS=(
+            --no-playlist
+            --merge-output-format mp4
+            -P dl
+            -o "%(title).100B.%(ext)s"
+            -f "bv*[height<=1080]+ba/b[height<=1080]/bv*+ba/b/best"
+            --retries 10
+            --fragment-retries 10
+            --concurrent-fragments 4
+            --socket-timeout 30
+          )
+          if [ -n "${{ secrets.COOKIES }}" ]; then
+            printf '%s\n' "${{ secrets.COOKIES }}" > cookies.txt
+            ARGS+=(--cookiefile cookies.txt)
+          fi
+          yt-dlp "${ARGS[@]}" "$URL"
+
+          FILE="$(ls -S dl | head -n1)"
+          [ -n "$FILE" ] || { echo "::error::File download nahi hui"; exit 1; }
+          SIZE=$(stat -c%s "dl/$FILE")
+          echo "FILE=$FILE" >> "$GITHUB_ENV"
+          echo "SIZE=$SIZE" >> "$GITHUB_ENV"
+          echo "Got: $FILE ($((SIZE/1048576)) MB)"
+          [ "$SIZE" -lt 14000000000 ] || { echo "::error::File 14GB se badi hai"; exit 1; }
+
+      - name: Upload to MEGA
+        run: |
+          set -euo pipefail
+          rclone move "dl/$FILE" ":mega:$FOLDER" \
+            -v --stats=15s --stats-one-line \
+            --transfers 1 --checkers 4 \
+            --retries 3 --low-level-retries 5 \
+            --contimeout 60s --timeout 300s
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### okru2mega"
+            echo "- Source: $URL"
+            echo "- File: ${FILE:-—}"
+            echo "- Size: $(( ${SIZE:-0} / 1048576 )) MB"
+            echo "- Target: \`MEGA:/$FOLDER\`"
+            echo "- Result: ${{ job.status }}"
+          } >> "$GITHUB_STEP_SUMMARY"
